@@ -61,7 +61,7 @@ srv.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initiali
 
 const tools = await rpc('tools/list', {});
 const names = tools.result.tools.map((t) => t.name);
-check('tools/list returns all 10 tools', names.length === 10, names.join(', '));
+check('tools/list returns all 11 tools (10 original + figma_use_file)', names.length === 11 && names.includes('figma_use_file'), names.join(', '));
 
 // --- disconnected state ----------------------------------------------------
 const offline = await rpc('tools/call', { name: 'figma_status', arguments: {} });

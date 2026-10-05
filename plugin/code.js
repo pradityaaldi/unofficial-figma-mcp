@@ -799,6 +799,12 @@ const commands = {
 
 figma.ui.onmessage = async (msg) => {
   if (msg.type === 'status') return; // UI-only chatter
+  if (msg.type === 'ui_ready') {
+    // Tell the bridge which file this plugin instance belongs to, so several
+    // files can stay connected at the same time.
+    figma.ui.postMessage({ type: 'whoami', file: figma.root.name });
+    return;
+  }
 
   const { id, command, params } = msg;
   const handler = commands[command];

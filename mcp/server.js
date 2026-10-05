@@ -27,12 +27,36 @@ const log = (...a) => process.stderr.write('[bridge] ' + a.join(' ') + '\n');
 
 // ------------------------------------------------------------ plugin channel
 
-let plugin = null;
+// Multi-file: every Figma file that runs the plugin keeps its own socket,
+// keyed by file name. Only the primary bridge holds this map. A relay process
+// instead has one `upstream` socket to the primary bridge.
+const plugins = new Map();
+let upstream = null;
+let defaultFile = null;
 const pending = new Map();
 const forwarded = new Map();
 let seq = 0;
 let forwardSeq = 0;
 let relayRetry = null;
+
+const openFiles = () => [...plugins.entries()].filter(([, ws]) => ws.readyState === WebSocket.OPEN).map(([name]) => name);
+
+// Choose the plugin socket for a request. With one connected file nothing needs
+// to be specified (same behaviour as before). With several, the caller must name
+// one, directly or through figma_use_file, so a write can never land in the
+// wrong file by accident.
+function pickPlugin(file, useDefault = true) {
+  const names = openFiles();
+  if (!names.length) return { error: 'Figma plugin not connected. Run Unofficial Figma MCP in Figma.' };
+  const want = file || (useDefault ? defaultFile : null);
+  if (want) {
+    const hit = names.find((n) => n === want) || names.find((n) => n.toLowerCase() === String(want).toLowerCase());
+    if (!hit) return { error: `File "${want}" is not connected. Connected files: ${names.join(', ')}` };
+    return { name: hit, ws: plugins.get(hit) };
+  }
+  if (names.length === 1) return { name: names[0], ws: plugins.get(names[0]) };
+  return { error: `Several Figma files are connected (${names.join(', ')}). Pass "file" or call figma_use_file first.` };
+}
 
 const wss = new WebSocketServer({ port: PORT, host: '127.0.0.1' });
 
@@ -49,9 +73,12 @@ wss.on('connection', (ws) => {
     if (msg.type === 'hello') {
       role = msg.role === 'relay' ? 'relay' : 'plugin';
       if (role === 'plugin') {
-        log('plugin connected');
-        if (plugin && plugin !== ws) plugin.close(1012, 'Replaced by a newer plugin connection');
-        plugin = ws;
+        const file = String(msg.file || 'unknown');
+        ws._file = file;
+        log('plugin connected: ' + file);
+        const old = plugins.get(file);
+        if (old && old !== ws) old.close(1012, 'Replaced by a newer connection from the same file');
+        plugins.set(file, ws);
       } else {
         log('MCP relay connected');
       }
@@ -59,17 +86,20 @@ wss.on('connection', (ws) => {
     }
 
     if (role === 'relay') {
-      if (!plugin || plugin.readyState !== WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          id: msg.id,
-          ok: false,
-          error: 'Figma plugin not connected. Run Unofficial Figma MCP in Figma.',
-        }));
+      if (msg.command === '__files') {
+        ws.send(JSON.stringify({ id: msg.id, ok: true, data: { files: openFiles() } }));
+        return;
+      }
+      // A relay carries its own default file; this process's default never leaks across sessions.
+      const pick = pickPlugin(msg.file, false);
+      if (pick.error) {
+        ws.send(JSON.stringify({ id: msg.id, ok: false, error: pick.error }));
         return;
       }
       const forwardedId = `relay-${++forwardSeq}`;
-      forwarded.set(forwardedId, { relay: ws, originalId: msg.id });
-      plugin.send(JSON.stringify({ ...msg, id: forwardedId }));
+      forwarded.set(forwardedId, { relay: ws, originalId: msg.id, target: pick.ws });
+      const { file: _drop, ...rest } = msg;
+      pick.ws.send(JSON.stringify({ ...rest, id: forwardedId }));
       return;
     }
 
@@ -89,9 +119,10 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (role === 'plugin') log('plugin disconnected');
     if (role === 'relay') log('MCP relay disconnected');
-    if (plugin === ws) {
-      plugin = null;
+    if (role === 'plugin') {
+      if (plugins.get(ws._file) === ws) plugins.delete(ws._file);
       for (const [id, entry] of forwarded) {
+        if (entry.target !== ws) continue;
         if (entry.relay.readyState === WebSocket.OPEN) {
           entry.relay.send(JSON.stringify({
             id: entry.originalId,
@@ -109,10 +140,11 @@ wss.on('connection', (ws) => {
     // disconnects must not cancel requests owned by the primary MCP process.
     if (role === 'plugin') {
       for (const [id, entry] of pending) {
+        if (entry.target !== ws) continue;
         clearTimeout(entry.timer);
         entry.resolve({ id, ok: false, error: 'Plugin disconnected mid-request' });
+        pending.delete(id);
       }
-      pending.clear();
     }
   });
 
@@ -135,7 +167,7 @@ function connectRelay() {
   ws.on('open', () => {
     log('connected to shared bridge');
     ws.send(JSON.stringify({ type: 'hello', role: 'relay' }));
-    plugin = ws;
+    upstream = ws;
   });
 
   ws.on('message', (raw) => {
@@ -149,7 +181,7 @@ function connectRelay() {
   });
 
   const reconnect = () => {
-    if (plugin === ws) plugin = null;
+    if (upstream === ws) upstream = null;
     for (const [id, entry] of pending) {
       clearTimeout(entry.timer);
       entry.resolve({ id, ok: false, error: 'Shared bridge disconnected mid-request' });
@@ -177,19 +209,32 @@ function settle(msg) {
   entry.resolve(msg);
 }
 
-function send(command, params = {}, onProgress) {
+function send(command, params = {}, onProgress, file) {
   return new Promise((resolve, reject) => {
-    if (!plugin || plugin.readyState !== 1) {
-      reject(
-        new Error(
-          'Figma plugin not connected. In Figma: Plugins > Development > Unofficial Figma MCP, ' +
-            'then press Connect.'
-        )
-      );
-      return;
+    let target;
+    if (upstream) {
+      if (upstream.readyState !== 1) {
+        reject(new Error('Shared bridge not connected.'));
+        return;
+      }
+      target = upstream;
+    } else {
+      const pick = pickPlugin(file, true);
+      if (pick.error) {
+        reject(
+          new Error(
+            pick.error.startsWith('Figma plugin not connected')
+              ? 'Figma plugin not connected. In Figma: Plugins > Development > Unofficial Figma MCP, ' +
+                'then press Connect.'
+              : pick.error
+          )
+        );
+        return;
+      }
+      target = pick.ws;
     }
     const id = String(++seq);
-    const entry = { resolve, onProgress, timer: null };
+    const entry = { resolve, onProgress, timer: null, target };
     entry.arm = () => {
       clearTimeout(entry.timer);
       entry.timer = setTimeout(() => {
@@ -199,14 +244,16 @@ function send(command, params = {}, onProgress) {
     };
     entry.arm();
     pending.set(id, entry);
-    plugin.send(JSON.stringify({ id, command, params }));
+    const payload = { id, command, params };
+    if (upstream) payload.file = file || defaultFile || undefined;
+    target.send(JSON.stringify(payload));
   });
 }
 
 // A plugin-side throw is a normal outcome, not a transport failure — surface the
 // message to the model so it can correct the script.
-async function call(command, params, onProgress) {
-  const res = await send(command, params, onProgress);
+async function call(command, params, onProgress, file) {
+  const res = await send(command, params, onProgress, file);
   if (!res.ok) throw new Error(res.error + (res.stack ? '\n' + res.stack : ''));
   return res.data;
 }
@@ -515,8 +562,27 @@ const TOOLS = [
   },
 ];
 
+const FILE_PARAM = {
+  type: 'string',
+  description: 'Target Figma file (name as listed by figma_status). Optional when only one file is connected or after figma_use_file.',
+};
+for (const t of TOOLS) {
+  t.inputSchema.properties = { ...(t.inputSchema.properties || {}), file: FILE_PARAM };
+}
+TOOLS.push({
+  name: 'figma_use_file',
+  description:
+    'When several Figma files run the plugin at the same time, choose which one later tool calls target by default. ' +
+    'Individual calls can still override it with their own `file`.',
+  inputSchema: {
+    type: 'object',
+    properties: { file: { type: 'string', description: 'File name from figma_status.' } },
+    required: ['file'],
+  },
+});
+
 const server = new Server(
-  { name: 'unofficial-figma-mcp', version: '0.3.0' },
+  { name: 'unofficial-figma-mcp', version: '0.3.0-multi.1' },
   { capabilities: { tools: {} } }
 );
 
@@ -545,12 +611,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         }).catch(() => {});
       };
 
+  const callIn = (command, params, onProg) => call(command, params, onProg, args.file);
+  const connectedFiles = async () => (upstream ? (await call('__files', {}, undefined, undefined)).files : openFiles());
+
   try {
     switch (name) {
+      case 'figma_use_file': {
+        const names = await connectedFiles();
+        const want = String(args.file || '');
+        const hit = names.find((n) => n === want) || names.find((n) => n.toLowerCase() === want.toLowerCase());
+        if (!hit) throw new Error(`File "${want}" is not connected. Connected files: ${names.join(', ') || '(none)'}`);
+        defaultFile = hit;
+        return text({ defaultFile: hit, connectedFiles: names });
+      }
+
       case 'figma_build':
         await resolveBuildImages(args.nodes || (args.node ? [args.node] : []));
         return text(
-          await call(
+          await callIn(
             'build',
             {
               node: args.node,
@@ -564,7 +642,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         );
 
       case 'figma_exec':
-        return text(await call('exec', { code: args.code }, onProgress));
+        return text(await callIn('exec', { code: args.code }, onProgress));
 
       case 'figma_upload_image': {
         const img = await loadImageSource(args.source);
@@ -573,7 +651,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
           ? undefined
           : args.source.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
         return text(
-          await call('place_image', {
+          await callIn('place_image', {
             base64: img.base64,
             svg: img.svg,
             nodeId: args.nodeId,
@@ -590,7 +668,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       }
 
       case 'figma_screenshot': {
-        const r = await call('screenshot', { nodeId: args.nodeId, scale: args.scale, maxSize: args.maxSize });
+        const r = await callIn('screenshot', { nodeId: args.nodeId, scale: args.scale, maxSize: args.maxSize });
         return {
           content: [
             { type: 'text', text: JSON.stringify(r.meta) },
@@ -600,29 +678,37 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       }
 
       case 'figma_get_metadata':
-        return text(await call('get_metadata', { nodeId: args.nodeId, depth: args.depth }));
+        return text(await callIn('get_metadata', { nodeId: args.nodeId, depth: args.depth }));
 
       case 'figma_get_selection':
-        return text(await call('get_selection'));
+        return text(await callIn('get_selection'));
 
       case 'figma_get_pages':
-        return text(await call('get_pages'));
+        return text(await callIn('get_pages'));
 
       case 'figma_set_page':
-        return text(await call('set_page', { pageId: args.pageId }));
+        return text(await callIn('set_page', { pageId: args.pageId }));
 
       case 'figma_status': {
-        if (!plugin || plugin.readyState !== 1) {
+        const names = await connectedFiles();
+        if (!names.length) {
           return text({
             connected: false,
             hint: 'Open the file in Figma, run Plugins > Development > Unofficial Figma MCP, press Connect.',
           });
         }
-        return text({ connected: true, ...(await call('ping')) });
+        if (args.file || names.length === 1) {
+          return text({ connected: true, ...(await callIn('ping')), files: names, defaultFile });
+        }
+        const detail = [];
+        for (const n of names) {
+          try { detail.push(await call('ping', {}, undefined, n)); } catch (e) { detail.push({ file: n, error: e.message }); }
+        }
+        return text({ connected: true, files: names, details: detail, defaultFile });
       }
 
       case 'figma_toggle_ui':
-        return text(await call(args.visible ? 'show_ui' : 'hide_ui'));
+        return text(await callIn(args.visible ? 'show_ui' : 'hide_ui'));
 
       default:
         throw new Error('Unknown tool: ' + name);

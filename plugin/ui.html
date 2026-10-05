@@ -42,6 +42,8 @@
   let retry = null;
   let manualStop = false;
   let backoff = 500;
+  let fileName = null;   // set by code.js (whoami); identifies this file to the bridge
+  let started = false;
 
   // Bounded so a long session does not slow the hidden iframe down.
   const lines = [];
@@ -70,10 +72,10 @@
     }
 
     ws.onopen = () => {
-      setState(true, 'connected');
-      log('connected');
+      setState(true, 'connected' + (fileName ? ': ' + fileName : ''));
+      log('connected' + (fileName ? ' as "' + fileName + '"' : ''));
       backoff = 500;
-      ws.send(JSON.stringify({ type: 'hello', role: 'plugin' }));
+      ws.send(JSON.stringify({ type: 'hello', role: 'plugin', file: fileName }));
     };
 
     ws.onmessage = (ev) => {
@@ -89,7 +91,14 @@
       parent.postMessage({ pluginMessage: msg }, '*');
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
+      // Code 1012: another window of the SAME file took over. Do not fight it.
+      if (ev && ev.code === 1012) {
+        manualStop = true;
+        setState(false, 'replaced by another window of this file');
+        log('replaced by a newer connection from the same file');
+        return;
+      }
       setState(false, 'disconnected');
       if (!manualStop && $('auto').checked) {
         // Reconnect quickly after a server restart, back off if it stays down.
@@ -105,6 +114,11 @@
   // (screenshots are base64-encoded natively on the main thread).
   window.onmessage = (ev) => {
     const msg = ev.data.pluginMessage;
+    if (msg && msg.type === 'whoami') {
+      fileName = msg.file || null;
+      if (!started) { started = true; connect(); }
+      return;
+    }
     if (!msg || (msg.type !== 'result' && msg.type !== 'progress')) return;
     if (msg.type === 'result') log((msg.ok ? '✓ ' : '✗ ') + (msg.error || 'ok'));
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
@@ -120,5 +134,8 @@
     }
   };
 
-  connect();
+  // Ask code.js for the file name first, then connect. Fall back after 1.5 s
+  // (an older code.js never answers) so the plugin still works as before.
+  parent.postMessage({ pluginMessage: { type: 'ui_ready' } }, '*');
+  setTimeout(() => { if (!started) { started = true; connect(); } }, 1500);
 </script>

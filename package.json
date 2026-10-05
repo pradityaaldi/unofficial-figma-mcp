@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/multi-client.js",
+    "test": "node test/smoke.js && node test/multi-client.js && node test/multi-file.js",
     "start": "node bin/cli.js",
     "dev": "BRIDGE_LOG=1 node bin/cli.js"
   },
